@@ -60,6 +60,8 @@
 #include "preprocess.h"
 #include <ikd-Tree/ikd_Tree.h>
 
+#include <algorithm>    // std::random_shuffle
+
 #define INIT_TIME           (0.1)
 #define LASER_POINT_COV     (0.001)
 #define MAXN                (720000)
@@ -124,6 +126,9 @@ V3D euler_cur;
 V3D position_last(Zero3d);
 V3D Lidar_T_wrt_IMU(Zero3d);
 M3D Lidar_R_wrt_IMU(Eye3d);
+
+// JJH
+int random_table[NUM_MATCH_POINTS][NUM_SAMPLE];
 
 /*** EKF inputs and output ***/
 MeasureGroup Measures;
@@ -630,13 +635,25 @@ void publish_path(const ros::Publisher pubPath)
     }
 }
 
-void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_data)
+
+
+// EM plane model
+void hem_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_data)
 {
     double match_start = omp_get_wtime();
     laserCloudOri->clear(); 
     corr_normvect->clear(); 
-    total_residual = 0.0; 
+    total_residual = 0.0;
 
+    // Tunning parameters
+    float ransac_thr = 0.1;
+    int num_plane = 3;
+    int N_iter = 5;
+
+    std::vector<VF(4)> norm_vecs[feats_down_size];
+    std::vector<float> residuals[feats_down_size];
+
+    ros::Time start_time = ros::Time::now();
     /** closest surface search and residual computation **/
     #ifdef MP_EN
         omp_set_num_threads(MP_PROC_NUM);
@@ -659,6 +676,7 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
 
         auto &points_near = Nearest_Points[i];
 
+        // std::cout << "ekfom_data.converge = " << ekfom_data.converge << std::endl;
         if (ekfom_data.converge)
         {
             /** Find the closest surfaces in the map **/
@@ -667,38 +685,107 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
         }
 
         if (!point_selected_surf[i]) continue;
-
-        VF(4) pabcd;
         point_selected_surf[i] = false;
-        if (esti_plane(pabcd, points_near, 0.1f))
-        {
-            float pd2 = pabcd(0) * point_world.x + pabcd(1) * point_world.y + pabcd(2) * point_world.z + pabcd(3);
-            float s = 1 - 0.9 * fabs(pd2) / sqrt(p_body.norm());
 
-            if (s > 0.9)
-            {
-                point_selected_surf[i] = true;
-                normvec->points[i].x = pabcd(0);
-                normvec->points[i].y = pabcd(1);
-                normvec->points[i].z = pabcd(2);
-                normvec->points[i].intensity = pd2;
-                res_last[i] = abs(pd2);
+        // Ransac planes
+        PointVector pt = points_near;
+
+        // Plane hypothesis iter
+        for (int j = 0; j < num_plane; j++) {
+            float vote_best = 1e+10;
+            int N_pt = pt.size();
+
+            if (N_pt < 2*NUM_SAMPLE) break;
+
+            VF(4) nvec_best;
+            bool isval_j = false;
+            std::vector<int> idx_remain_best;
+
+            // ros::Time start_time = ros::Time::now();
+            // Ransac iter
+            for (int iter = 0; iter < N_iter; iter++) {
+                PointVector p_i;
+                std::vector<int> idx_i;
+
+                // Randomly select candidates
+                for (int ii = 0; ii < N_pt; ii++) idx_i.push_back(ii);
+                std::random_shuffle(idx_i.begin(), idx_i.end());
+                for (int ii = 0; ii < NUM_SAMPLE; ii++) p_i.push_back(pt[idx_i[ii]]);
+
+                VF(4) abcd_i;
+                if (!esti_plane_JJH(abcd_i, p_i, ransac_thr)) continue;
+
+                // std::cout << abcd_i << std::endl;
+                PointVector support_i;
+                std::vector<int> idx_remain;
+
+                float vote_i = 0;
+
+                for (int ii = 0; ii < N_pt; ii++) {
+
+                    float cost_ii = abcd_i(0)*pt[ii].x + abcd_i(1)*pt[ii].y + abcd_i(2)*pt[ii].z + abcd_i(3);
+                    float sqcost_ii = cost_ii*cost_ii;
+
+                    if (fabs(cost_ii) < ransac_thr) {
+                        vote_i += sqcost_ii;
+                        support_i.push_back(pt[ii]);
+                    }
+                    else {
+                        idx_remain.push_back(ii);
+                    }
+                }
+
+                if (vote_i < vote_best) {
+
+                    vote_best = vote_i;
+                    idx_remain_best = idx_remain;
+
+                    if(esti_plane_JJH(nvec_best, support_i, ransac_thr)) isval_j = true;
+                    
+                }
+            }
+
+            // Saving fitted plane
+            if (isval_j) {
+                PointVector pt_remain;
+                for (int ii = 0; ii < idx_remain_best.size(); ii++) pt_remain.push_back(pt[idx_remain_best[ii]]);
+                pt.clear();
+                pt = pt_remain;
+
+                float pd2 = nvec_best(0)*point_world.x + nvec_best(1)*point_world.y + nvec_best(2)*point_world.z + nvec_best(3);
+                float s = 1 - 0.9 * fabs(pd2) / sqrt(p_body.norm());
+                if (s > 0.9) {
+                    point_selected_surf[i] = true;
+                    norm_vecs[i].push_back(nvec_best);
+                    residuals[i].push_back(pd2);
+                }
+            }
+        }
+    }
+
+    // Assign measurements
+    effct_feat_num = 0;
+    for (int i = 0; i < feats_down_size; i++) {
+        if (point_selected_surf[i]) {
+            for (int ii = 0; ii < norm_vecs[i].size(); ii++) {
+
+                laserCloudOri->points[effct_feat_num] = feats_down_body->points[i];
+                corr_normvect->points[effct_feat_num].x = norm_vecs[i][ii](0);
+                corr_normvect->points[effct_feat_num].y = norm_vecs[i][ii](1);
+                corr_normvect->points[effct_feat_num].z = norm_vecs[i][ii](2);
+                corr_normvect->points[effct_feat_num].intensity = residuals[i][ii];
+
+                total_residual += abs(residuals[i][ii]);
+                effct_feat_num ++;
+
+                // std::cout << ii <<  " th plane, norm_vec = " << norm_vecs[i][ii](0) << " " << norm_vecs[i][ii](1) << " " << norm_vecs[i][ii](2)
+                //         << " " <<  " residual = " << residuals[i][ii] << std::endl;
             }
         }
     }
     
-    effct_feat_num = 0;
-
-    for (int i = 0; i < feats_down_size; i++)
-    {
-        if (point_selected_surf[i])
-        {
-            laserCloudOri->points[effct_feat_num] = feats_down_body->points[i];
-            corr_normvect->points[effct_feat_num] = normvec->points[i];
-            total_residual += res_last[i];
-            effct_feat_num ++;
-        }
-    }
+    double icp_time = (ros::Time::now()-start_time).toSec();
+    std::cout << "feats_down_size = " << feats_down_size << "   effct_feat_num = " << effct_feat_num << "   ICP time = " << icp_time << std::endl;
 
     if (effct_feat_num < 1)
     {
@@ -746,6 +833,149 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
         ekfom_data.h(i) = -norm_p.intensity;
     }
     solve_time += omp_get_wtime() - solve_start_;
+}
+
+
+void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_data)
+{
+    double match_start = omp_get_wtime();
+    laserCloudOri->clear(); 
+    corr_normvect->clear(); 
+    total_residual = 0.0; 
+
+    std::cout << "h_share_model EXCUTED!!!" << std::endl;
+
+    /** closest surface search and residual computation **/
+    #ifdef MP_EN
+        omp_set_num_threads(MP_PROC_NUM);
+        #pragma omp parallel for
+    #endif
+    for (int i = 0; i < feats_down_size; i++)
+    {
+        PointType &point_body  = feats_down_body->points[i]; 
+        PointType &point_world = feats_down_world->points[i]; 
+
+        /* transform to world frame */
+        V3D p_body(point_body.x, point_body.y, point_body.z);
+        V3D p_global(s.rot * (s.offset_R_L_I*p_body + s.offset_T_L_I) + s.pos);
+        point_world.x = p_global(0);
+        point_world.y = p_global(1);
+        point_world.z = p_global(2);
+        point_world.intensity = point_body.intensity;
+
+        vector<float> pointSearchSqDis(NUM_MATCH_POINTS);
+
+        auto &points_near = Nearest_Points[i];
+
+        // std::cout << "ekfom_data.converge = " << ekfom_data.converge << std::endl;
+        if (ekfom_data.converge)
+        {
+            /** Find the closest surfaces in the map **/
+            ikdtree.Nearest_Search(point_world, NUM_MATCH_POINTS, points_near, pointSearchSqDis);
+            point_selected_surf[i] = points_near.size() < NUM_MATCH_POINTS ? false : pointSearchSqDis[NUM_MATCH_POINTS - 1] > 5 ? false : true;
+        }
+
+        if (!point_selected_surf[i]) continue;
+
+        VF(4) pabcd;
+        point_selected_surf[i] = false;
+        if (esti_plane(pabcd, points_near, 0.1f))
+        {
+            float pd2 = pabcd(0) * point_world.x + pabcd(1) * point_world.y + pabcd(2) * point_world.z + pabcd(3);
+            float s = 1 - 0.9 * fabs(pd2) / sqrt(p_body.norm());
+
+            if (s > 0.9)
+            {
+                point_selected_surf[i] = true;
+                normvec->points[i].x = pabcd(0);
+                normvec->points[i].y = pabcd(1);
+                normvec->points[i].z = pabcd(2);
+                normvec->points[i].intensity = pd2;
+                res_last[i] = abs(pd2);
+            }
+        }
+    }
+    
+    effct_feat_num = 0;
+
+    for (int i = 0; i < feats_down_size; i++)
+    {
+        if (point_selected_surf[i])
+        {
+            laserCloudOri->points[effct_feat_num] = feats_down_body->points[i];
+            corr_normvect->points[effct_feat_num] = normvec->points[i];
+            total_residual += res_last[i];
+            effct_feat_num ++;
+        }
+    }
+    std::cout << "feats_down_size = " << feats_down_size << "   effct_feat_num = " << effct_feat_num << std::endl;
+
+    if (effct_feat_num < 1)
+    {
+        ekfom_data.valid = false;
+        ROS_WARN("No Effective Points! \n");
+        return;
+    }
+
+    res_mean_last = total_residual / effct_feat_num;
+    match_time  += omp_get_wtime() - match_start;
+    double solve_start_  = omp_get_wtime();
+    
+    /*** Computation of Measuremnt Jacobian matrix H and measurents vector ***/
+    ekfom_data.h_x = MatrixXd::Zero(effct_feat_num, 12); //23
+    ekfom_data.h.resize(effct_feat_num);
+
+    for (int i = 0; i < effct_feat_num; i++)
+    {
+        const PointType &laser_p  = laserCloudOri->points[i];
+        V3D point_this_be(laser_p.x, laser_p.y, laser_p.z);
+        M3D point_be_crossmat;
+        point_be_crossmat << SKEW_SYM_MATRX(point_this_be);
+        V3D point_this = s.offset_R_L_I * point_this_be + s.offset_T_L_I;
+        M3D point_crossmat;
+        point_crossmat<<SKEW_SYM_MATRX(point_this);
+
+        /*** get the normal vector of closest surface/corner ***/
+        const PointType &norm_p = corr_normvect->points[i];
+        V3D norm_vec(norm_p.x, norm_p.y, norm_p.z);
+
+        /*** calculate the Measuremnt Jacobian matrix H ***/
+        V3D C(s.rot.conjugate() *norm_vec);
+        V3D A(point_crossmat * C);
+        if (extrinsic_est_en)
+        {
+            V3D B(point_be_crossmat * s.offset_R_L_I.conjugate() * C); //s.rot.conjugate()*norm_vec);
+            ekfom_data.h_x.block<1, 12>(i,0) << norm_p.x, norm_p.y, norm_p.z, VEC_FROM_ARRAY(A), VEC_FROM_ARRAY(B), VEC_FROM_ARRAY(C);
+        }
+        else
+        {
+            ekfom_data.h_x.block<1, 12>(i,0) << norm_p.x, norm_p.y, norm_p.z, VEC_FROM_ARRAY(A), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0;
+        }
+
+        /*** Measuremnt: distance to the closest surface/corner ***/
+        ekfom_data.h(i) = -norm_p.intensity;
+    }
+    solve_time += omp_get_wtime() - solve_start_;
+}
+
+void init_random_table() {
+    for (int i = 0; i < NUM_MATCH_POINTS; i++) {
+
+        if (i >= NUM_SAMPLE) {
+            std::vector<int> idx_i;
+            for (int ii = 0; ii <= i; ii++) idx_i.push_back(ii);
+            std::random_shuffle(idx_i.begin(), idx_i.end());
+
+            for (int j = 0; j < NUM_SAMPLE; j++) random_table[i][j] = idx_i[j];
+        }
+    }
+
+    for (int ii = 0; ii < NUM_MATCH_POINTS; ii++) {
+        for (int jj = 0; jj < NUM_SAMPLE; jj++) {
+            std::cout << random_table[ii][jj] << " ";
+        }
+        std::cout << "\n" << std::endl;
+    }
 }
 
 int main(int argc, char** argv)
@@ -818,7 +1048,8 @@ int main(int argc, char** argv)
 
     double epsi[23] = {0.001};
     fill(epsi, epsi+23, 0.001);
-    kf.init_dyn_share(get_f, df_dx, df_dw, h_share_model, NUM_MAX_ITERATIONS, epsi);
+    // kf.init_dyn_share(get_f, df_dx, df_dw, h_share_model, NUM_MAX_ITERATIONS, epsi);
+    kf.init_dyn_share(get_f, df_dx, df_dw, hem_share_model, NUM_MAX_ITERATIONS, epsi);
 
     /*** debug record ***/
     FILE *fp;
@@ -896,6 +1127,8 @@ int main(int argc, char** argv)
             /*** downsample the feature points in a scan ***/
             downSizeFilterSurf.setInputCloud(feats_undistort);
             downSizeFilterSurf.filter(*feats_down_body);
+            // JJH
+            // std::cout << "feats_undistort.size() = " << feats_undistort->points.size() << "   feats_down_body.size() = " << feats_down_body->points.size() << std::endl;
             t1 = omp_get_wtime();
             feats_down_size = feats_down_body->points.size();
             /*** initialize the map kdtree ***/
@@ -1001,8 +1234,14 @@ int main(int argc, char** argv)
                 time_log_counter ++;
                 printf("[ mapping ]: time: IMU + Map + Input Downsample: %0.6f ave match: %0.6f ave solve: %0.6f  ave ICP: %0.6f  map incre: %0.6f ave total: %0.6f icp: %0.6f construct H: %0.6f \n",t1-t0,aver_time_match,aver_time_solve,t3-t1,t5-t3,aver_time_consu,aver_time_icp, aver_time_const_H_time);
                 ext_euler = SO3ToEuler(state_point.offset_R_L_I);
+
+                // Report covariance (JJH)
+                auto covariance_mtx = kf.get_P();
+
                 fout_out << setw(20) << Measures.lidar_beg_time - first_lidar_time << " " << euler_cur.transpose() << " " << state_point.pos.transpose()<< " " << ext_euler.transpose() << " "<<state_point.offset_T_L_I.transpose()<<" "<< state_point.vel.transpose() \
-                <<" "<<state_point.bg.transpose()<<" "<<state_point.ba.transpose()<<" "<<state_point.grav<<" "<<feats_undistort->points.size()<<endl;
+                <<" "<<state_point.bg.transpose()<<" "<<state_point.ba.transpose()<<" "<<state_point.grav<<" "<<feats_undistort->points.size()
+                <<" "<<covariance_mtx(0,0)<<" "<<covariance_mtx(1,1)<<" "<<covariance_mtx(2,2)
+                <<" "<<covariance_mtx(3,3)<<" "<<covariance_mtx(4,4)<<" "<<covariance_mtx(5,5)<<endl;
                 dump_lio_state_to_log(fp);
             }
         }

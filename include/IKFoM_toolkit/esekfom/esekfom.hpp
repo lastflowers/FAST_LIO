@@ -1645,6 +1645,8 @@ public:
 				spMt h_x_ = dyn_share.h_x.sparseView();
 			#else
 				Eigen::Matrix<scalar_type, Eigen::Dynamic, 12> h_x_ = dyn_share.h_x;
+				// JJH
+				// std::cout << "h_x_.cols() = " << h_x_.cols() << "   h_x_.rows() = " << h_x_.rows() << std::endl;
 			#endif
 			double solve_start = omp_get_wtime();
 			dof_Measurement = h_x_.rows();

@@ -23,7 +23,9 @@ using namespace Eigen;
 #define CUBE_LEN  (6.0)
 #define LIDAR_SP_LEN    (2)
 #define INIT_COV   (1)
-#define NUM_MATCH_POINTS    (5)
+// #define NUM_MATCH_POINTS    (5)
+#define NUM_MATCH_POINTS    (20)
+#define NUM_SAMPLE (5)
 #define MAX_MEAS_DIM        (10000)
 
 #define VEC_FROM_ARRAY(v)        v[0],v[1],v[2]
@@ -213,7 +215,7 @@ bool esti_normvector(Matrix<T, 3, 1> &normvec, const PointVector &point, const T
         }
     }
 
-    normvec.normalize();
+    // normvec.normalize();
     return true;
 }
 
@@ -255,5 +257,42 @@ bool esti_plane(Matrix<T, 4, 1> &pca_result, const PointVector &point, const T &
     }
     return true;
 }
+
+
+template<typename T>
+bool esti_plane_JJH(Matrix<T, 4, 1> &pca_result, const PointVector &point, const T &threshold)
+{
+    int N_pt = point.size();
+    MatrixXf A(N_pt, 3);
+    MatrixXf b(N_pt, 1);
+    A.setZero();
+    b.setOnes();
+    b *= -1.0f;
+
+    for (int j = 0; j < N_pt; j++)
+    {
+        A(j,0) = point[j].x;
+        A(j,1) = point[j].y;
+        A(j,2) = point[j].z;
+    }
+
+    Matrix<T, 3, 1> normvec = A.colPivHouseholderQr().solve(b);
+
+    T n = normvec.norm();
+    pca_result(0) = normvec(0) / n;
+    pca_result(1) = normvec(1) / n;
+    pca_result(2) = normvec(2) / n;
+    pca_result(3) = 1.0 / n;
+
+    for (int j = 0; j < N_pt; j++)
+    {
+        if (fabs(pca_result(0) * point[j].x + pca_result(1) * point[j].y + pca_result(2) * point[j].z + pca_result(3)) > threshold)
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
 
 #endif
